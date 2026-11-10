@@ -173,7 +173,7 @@ async function startBrowser() {
       browser = context = page = null;
     }
   });
-  const ctx = await b.newContext({ viewport: { width: 1280, height: 720 }, ignoreHTTPSErrors: true });
+  const ctx = await b.newContext({ viewport: { width: 1366, height: 768 }, ignoreHTTPSErrors: true });
 
   // Client settings live in localStorage and must be set before Foundry boots.
   await ctx.addInitScript((noCanvas) => {
@@ -246,6 +246,25 @@ async function installLogger() {
 
 // ------------------------------------------------------------------ login
 
+// Saves what the join page looked like, for when the login form can't be found.
+async function dumpJoinPage() {
+  const base = path.join(CFG.logDir, "join-debug");
+  try {
+    fs.mkdirSync(CFG.logDir, { recursive: true });
+    fs.writeFileSync(`${base}.html`, await page.content());
+    await page.screenshot({ path: `${base}.png`, fullPage: true });
+    const info = await page.evaluate(() => ({
+      title: document.title,
+      fields: [...document.querySelectorAll("input, select, button")]
+        .map((e) => `${e.tagName.toLowerCase()}[name=${e.name || "-"}${e.offsetParent ? "" : ",hidden"}]`)
+        .join(" "),
+    }));
+    return `title "${info.title}", fields: ${info.fields || "none"} — saved ${base}.html/.png`;
+  } catch (err) {
+    return `could not save the page (${firstLine(err)})`;
+  }
+}
+
 const S = { loginFailures: 0, lastLoginAttempt: 0, loadingSince: 0, disconnectedSince: 0, errors: 0 };
 
 function loginFailed(msg) {
@@ -264,10 +283,15 @@ async function login(server) {
   const landed = new URL(page.url()).pathname;
   if (!/\/join\/?$/.test(landed)) return loginFailed(`/join redirected to ${landed} — is the world running?`);
 
-  // Foundry ≤14.365: <select name="userid">; 14.366+: <input name="username">.
-  const nameInput = page.locator('input[name="username"]');
-  const userSelect = page.locator('select[name="userid"]');
-  await nameInput.or(userSelect).first().waitFor({ timeout: 30_000 });
+  // The user field has been <select name="userid">, <input name="username"> and
+  // <select name="userId"> (14.369) across Foundry versions; match the name in any case.
+  const nameInput = page.locator('input[name="username" i]');
+  const userSelect = page.locator('select[name="userid" i]');
+  try {
+    await nameInput.or(userSelect).first().waitFor({ timeout: 30_000 });
+  } catch {
+    return loginFailed(`No login form on ${landed}: ${await dumpJoinPage()}`);
+  }
 
   let form;
   if (await nameInput.count()) {
