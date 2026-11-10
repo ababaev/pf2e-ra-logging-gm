@@ -1,0 +1,15 @@
+{
+  "name": "foundry-gm-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Keeps a headless GM logged into Foundry VTT and logs player actions",
+  "type": "module",
+  "main": "gm-bot.mjs",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node gm-bot.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.56.0"
+  }
+}
