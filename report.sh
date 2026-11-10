@@ -2,7 +2,7 @@
 # Human-readable view of the headless GM's action log.
 #
 #   ./report.sh                  today, players only
-#   ./report.sh -w               only tagged entries (hp, coins, xp, quantity, rules, chat-delete, ...)
+#   ./report.sh -w               only item entries (item-create, item-delete, quantity, coins), no socket lines
 #   ./report.sh -d yesterday     another day: YYYY-MM-DD | today | yesterday | all
 #   ./report.sh -u Vasya         one user (case-insensitive)
 #   ./report.sh -t coins         one tag

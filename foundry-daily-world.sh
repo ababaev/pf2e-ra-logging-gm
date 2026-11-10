@@ -9,7 +9,7 @@ set -Eeuo pipefail
 PM2_APP="foundry"
 FOUNDRY_DATA="/home/foundry/foundrydata"
 
-# pm2 name of the headless GM (foundry-gm-bot). Leave empty to skip.
+# pm2 name of the headless GM (pf2e-ra-logging-gm). Leave empty to skip.
 GM_BOT_APP="foundry-gm"
 
 # How long to wait for the world to come up after starting Foundry.

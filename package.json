@@ -1,5 +1,5 @@
 {
-  "name": "foundry-gm-bot",
+  "name": "pf2e-ra-logging-gm",
   "version": "1.0.0",
   "private": true,
   "description": "Keeps a headless GM logged into Foundry VTT and logs player actions",

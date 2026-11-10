@@ -1,10 +1,14 @@
 /*
- * Browser-side action logger for the headless Foundry GM.
+ * Browser-side inventory logger for the headless Foundry GM.
  *
  * gm-bot.mjs injects this function into the GM's Foundry page once the game is
  * ready. It only OBSERVES: it registers hooks and socket listeners and never
  * modifies any document. Every observation is passed to window.__gmLog(entry),
  * a Playwright binding that appends one JSON line to logs/actions-YYYY-MM-DD.jsonl.
+ *
+ * What it records: physical items (including coins) being created, deleted, or
+ * having their quantity changed, anywhere in the world; plus requests players
+ * send to the GM over sockets, which explain GM-relayed item transfers.
  *
  * Keep this file a single function declaration: gm-bot.mjs evaluates it as
  * `(<this file>)(config)`.
@@ -14,16 +18,11 @@ function installActionLogger(cfg) {
   const sink = globalThis.__gmLog;
   if (typeof sink !== "function") return "not installed: __gmLog binding missing";
 
-  const U = foundry.utils;
   const HooksApi = globalThis.foundry?.helpers?.Hooks ?? globalThis.Hooks;
   const MAX_STR = Number(cfg.maxString) || 300;
-  const MAX_CHANGES = 40;
-  const SUMMARY_CHANGES = 6;
-  const ignoreTypes = new Set(cfg.ignoreTypes ?? []);
-  const ignorePaths = cfg.ignorePaths ?? [];
+  const MAX_ITEMS_LISTED = 20;
   const selfId = game.user.id;
   const world = game.world.id;
-  const parser = new DOMParser();
 
   // ---------------------------------------------------------------- helpers
 
@@ -54,32 +53,6 @@ function installActionLogger(cfg) {
     };
   };
 
-  // Plain text from HTML without loading images or running anything (DOMParser docs are inert).
-  const plain = (html, max = MAX_STR) => {
-    if (!html) return "";
-    let t;
-    try {
-      t = parser.parseFromString(String(html), "text/html").body.textContent ?? "";
-    } catch {
-      t = String(html);
-    }
-    t = t.replace(/\s+/g, " ").trim();
-    return t.length > max ? `${t.slice(0, max)}…` : t;
-  };
-
-  // The first heading of a chat flavor, e.g. "Athletics Check" from a PF2e check card.
-  const heading = (html) => {
-    if (!html) return "";
-    try {
-      const body = parser.parseFromString(String(html), "text/html").body;
-      const h = body.querySelector("h1, h2, h3, h4, strong, b");
-      const text = (h ?? body).textContent.replace(/\s+/g, " ").trim();
-      return text.length > 80 ? `${text.slice(0, 80)}…` : text;
-    } catch {
-      return "";
-    }
-  };
-
   // JSON-safe, size-limited copy of any value.
   const safe = (v, depth = 0) => {
     if (v === undefined || v === null) return null;
@@ -99,7 +72,6 @@ function installActionLogger(cfg) {
     const proto = Object.getPrototypeOf(v);
     if (proto && proto !== Object.prototype) {
       const name = v.constructor?.name ?? "Object";
-      if (/Deletion/i.test(name)) return "<deleted>";
       if (typeof v.toJSON === "function") {
         try {
           return safe(v.toJSON(), depth + 1);
@@ -123,19 +95,6 @@ function installActionLogger(cfg) {
     return out;
   };
 
-  const short = (v) => {
-    let s;
-    try {
-      s = JSON.stringify(v);
-    } catch {
-      s = String(v);
-    }
-    if (s === undefined) s = "∅";
-    return s.length > 60 ? `${s.slice(0, 57)}…` : s;
-  };
-
-  const shortPath = (p) => p.replace(/^system\./, "");
-
   const docInfo = (doc) => {
     const parent = doc.parent ?? null;
     return {
@@ -154,255 +113,154 @@ function installActionLogger(cfg) {
 
   const PHYSICAL = new Set(["weapon", "armor", "shield", "equipment", "consumable", "treasure", "backpack", "book", "ammo"]);
   const isPhysical = (item) =>
-    typeof item?.isOfType === "function" ? item.isOfType("physical") : PHYSICAL.has(item?.type);
+    item?.documentName === "Item" &&
+    (typeof item.isOfType === "function" ? item.isOfType("physical") : PHYSICAL.has(item.type));
   const isCoin = (item) =>
     item?.documentName === "Item" &&
     (item.isCoinage ??
       (item.type === "treasure" && (item.system?.category === "coin" || item.system?.stackGroup === "coins")));
 
-  // Changed fields worth a second look. Tags are descriptive; filtering by user happens in report.sh.
-  const PATH_TAGS = [
-    [/^system\.attributes\.hp\.(value|temp|max)$/, "hp"],
-    [/^system\.details\.xp\.value$/, "xp"],
-    [/^system\.details\.level\.value$/, "level"],
-    [/^system\.resources\.heroPoints\.value$/, "hero-points"],
-    [/^system\.resources\.focus\.value$/, "focus"],
-    [/^system\.resources\.(?!heroPoints|focus)/, "resources"],
-    [/^system\.build\./, "build"],
-    [/^system\.(abilities|skills|saves|proficiencies|martial)\./, "stats"],
-    [/^system\.quantity$/, "quantity"],
-    [/^system\.(uses|charges)\.value$/, "uses"],
-    [/^system\.slots\./, "spell-slots"],
-    [/^system\.rules/, "rules"],
-    [/^system\.price\./, "price"],
-    [/^ownership\b/, "ownership"],
-    [/^role$/, "user-role"],
-  ];
+  const itemTags = (item, tag) => (isCoin(item) ? [tag, "coins"] : [tag]);
 
-  const tagsForPaths = (doc, paths) => {
-    const tags = new Set();
-    for (const p of paths) {
-      for (const [re, tag] of PATH_TAGS) if (re.test(p)) tags.add(tag);
-      if (p === "system.quantity" && isCoin(doc)) tags.add("coins");
-    }
-    return [...tags];
-  };
-
-  // ------------------------------------- snapshots of player-owned actors
-  // Remote updates arrive already applied, so "old" values come from our own copy.
-
-  const snaps = new Map();
-
+  // Players and the GM both use items: tag what happened on player-owned actors.
   const ownerActor = (doc) => {
     for (let d = doc; d; d = d.parent) if (d.documentName === "Actor") return d;
     return null;
   };
-  const isTracked = (actor) =>
-    !!actor && actor.documentName === "Actor" && !actor.isToken && !actor.pack && actor.hasPlayerOwner === true;
+  const onPlayerActor = (item) => ownerActor(item)?.hasPlayerOwner === true;
 
-  const embeddedFields = (doc) => Object.values(doc.constructor?.metadata?.embedded ?? {});
-  const embeddedDocs = (actor) => [...(actor.items ?? []), ...(actor.effects ?? [])];
+  // ------------------------------------------------- quantity snapshots
+  // Remote updates arrive already applied, so the old quantity comes from our own copy.
 
-  const remember = (doc) => {
-    const src = { ...doc._source };
-    for (const k of embeddedFields(doc)) delete src[k];
-    snaps.set(doc.uuid, U.deepClone(src));
+  const qty = new Map();
+
+  const remember = (item) => {
+    if (isPhysical(item) && !item.pack) qty.set(item.uuid, item.system?.quantity ?? null);
   };
 
   const forget = (doc) => {
-    snaps.delete(doc.uuid);
+    qty.delete(doc.uuid);
     const prefix = `${doc.uuid}.`;
-    for (const k of snaps.keys()) if (k.startsWith(prefix)) snaps.delete(k);
+    for (const k of qty.keys()) if (k.startsWith(prefix)) qty.delete(k);
   };
 
-  const refresh = (doc) => {
-    if (!isTracked(ownerActor(doc))) return forget(doc);
-    const known = snaps.has(doc.uuid);
-    remember(doc);
-    if (doc.documentName === "Actor" && !known) for (const e of embeddedDocs(doc)) remember(e);
+  const rememberActor = (actor) => {
+    for (const item of actor?.items ?? []) remember(item);
   };
 
-  let tracked = 0;
-  for (const actor of game.actors ?? []) {
-    if (!isTracked(actor)) continue;
-    tracked++;
-    remember(actor);
-    for (const e of embeddedDocs(actor)) remember(e);
-  }
-
-  // ------------------------------------------------------------- chat
-
-  const rollInfo = (roll) => {
-    try {
-      return {
-        formula: roll.formula ?? null,
-        total: roll.total ?? null,
-        dice: (roll.dice ?? []).map(
-          (d) => `d${d.faces}:${(d.results ?? []).map((r) => (r.active === false ? `(${r.result})` : r.result)).join(",")}`,
-        ),
-      };
-    } catch {
-      return { formula: "?", total: null, dice: [] };
+  for (const item of game.items ?? []) remember(item);
+  for (const actor of game.actors ?? []) rememberActor(actor);
+  // Unlinked tokens (loot piles, NPCs) carry their own copies of items.
+  for (const scene of game.scenes ?? []) {
+    for (const token of scene.tokens ?? []) {
+      if (token.actorLink) continue;
+      try {
+        rememberActor(token.actor);
+      } catch {
+        /* token without a valid base actor */
+      }
     }
-  };
-
-  const chatInfo = (msg) => {
-    const authorId = msg.author?.id ?? msg._source?.author ?? msg._source?.user ?? null;
-    const ctx = msg.flags?.pf2e?.context ?? null;
-    const info = {
-      messageId: msg.id ?? null,
-      author: game.users.get(authorId)?.name ?? authorId,
-      authorId,
-      speaker: msg.speaker?.alias ?? null,
-      whisper: (msg.whisper ?? []).map((id) => game.users.get(id)?.name ?? id),
-      blind: msg.blind === true,
-      title: heading(msg.flavor),
-      content: plain(msg.content),
-      rolls: (msg.rolls ?? []).map(rollInfo),
-    };
-    if (ctx) info.pf2e = { type: ctx.type ?? null, outcome: ctx.outcome ?? null, dc: ctx.dc?.value ?? null };
-    return info;
-  };
-
-  const chatText = (c) => {
-    const rolls = c.rolls
-      .map((r) => `${r.formula} = ${r.total}${r.dice.length ? ` [${r.dice.join(" ")}]` : ""}`)
-      .join("; ");
-    let s = c.title ? `[${c.title}] ` : "";
-    s += rolls || `"${c.content.length > 120 ? `${c.content.slice(0, 120)}…` : c.content}"`;
-    if (c.pf2e?.outcome) s += ` → ${c.pf2e.outcome}`;
-    if (c.pf2e?.dc != null) s += ` (DC ${c.pf2e.dc})`;
-    if (c.whisper.length) s += ` (whisper → ${c.whisper.join(", ")})`;
-    if (c.blind) s += " (blind)";
-    return s;
-  };
-
-  const looksLikeFakeRoll = (msg) =>
-    !(msg.rolls?.length > 0) && /class="[^"]*\bdice-(total|roll|formula)\b/.test(String(msg.content ?? ""));
+  }
 
   // --------------------------------------------------------- handlers
 
-  const onCreate = (doc, _options, userId) => {
+  const onCreateItem = (item, _options, userId) => {
+    if (!isPhysical(item) || item.pack) return;
+    remember(item);
     const w = who(userId);
-    if (doc.documentName === "ChatMessage") {
-      const chat = chatInfo(doc);
-      const tags = looksLikeFakeRoll(doc) ? ["roll-html-no-roll"] : [];
-      emit({ kind: "chat", ...w, chat, tags, summary: `${w.user} chat: ${chatText(chat)}` });
-      return;
-    }
-    const d = docInfo(doc);
-    const tags = [];
-    const extra = {};
-    const onPlayerActor = isTracked(ownerActor(doc)) && doc.documentName !== "Actor";
-    if (doc.documentName === "Item") {
-      if (doc.system?.quantity !== undefined) extra.quantity = doc.system.quantity;
-      if (onPlayerActor && isPhysical(doc)) tags.push("item-create");
-      if (onPlayerActor && isCoin(doc)) tags.push("coins");
-      const rules = doc.system?.rules;
-      if (Array.isArray(rules) && rules.length) extra.ruleElements = rules.length;
-    }
-    if (doc.documentName === "Macro" && doc.type === "script") {
-      tags.push("macro");
-      extra.command = safe(doc.command);
-    }
-    if (doc.documentName === "Actor") tags.push("actor-create");
-    const qty = extra.quantity !== undefined ? ` ×${extra.quantity}` : "";
-    emit({ kind: "create", ...w, doc: d, ...extra, tags, summary: `${w.user} created ${label(d)}${qty}` });
-    refresh(doc);
+    const d = docInfo(item);
+    const quantity = item.system?.quantity ?? null;
+    emit({
+      kind: "create",
+      ...w,
+      doc: d,
+      quantity,
+      playerOwned: onPlayerActor(item),
+      tags: itemTags(item, "item-create"),
+      summary: `${w.user} created ${label(d)} ×${quantity}`,
+    });
   };
 
-  const onUpdate = (doc, changed, _options, userId) => {
+  const onUpdateItem = (item, changed, _options, userId) => {
+    if (!isPhysical(item) || item.pack) return;
+    const had = qty.has(item.uuid);
+    const from = qty.get(item.uuid);
+    remember(item);
+    if (foundry.utils.getProperty(changed ?? {}, "system.quantity") === undefined) return;
+    const to = item.system?.quantity ?? null;
+    if (had && from === to) return;
+
     const w = who(userId);
-    const d = docInfo(doc);
-    const before = snaps.get(doc.uuid);
-    const flat = U.flattenObject(changed ?? {});
-    const all = [];
-    for (const [path, to] of Object.entries(flat)) {
-      if (ignorePaths.some((p) => path === p || path.startsWith(`${p}.`))) continue;
-      const c = { path, to: safe(to) };
-      if (before) c.from = safe(U.getProperty(before, path));
-      all.push(c);
-    }
-    refresh(doc);
-    if (!all.length) return;
-
-    const tags = tagsForPaths(doc, all.map((c) => c.path));
-    const entry = { kind: "update", ...w, doc: d, changes: all.slice(0, MAX_CHANGES), tags };
-    if (all.length > MAX_CHANGES) entry.moreChanges = all.length - MAX_CHANGES;
-
-    if (doc.documentName === "ChatMessage") {
-      const touched = all.some((c) => /^(content|rolls|flavor)\b/.test(c.path));
-      if (touched) {
-        entry.chat = chatInfo(doc);
-        tags.push("chat-edit");
-        entry.summary = `${w.user} EDITED chat message by ${entry.chat.author}: ${chatText(entry.chat)}`;
-        emit(entry);
-        return;
+    const d = docInfo(item);
+    const entry = { kind: "update", ...w, doc: d, quantity: { to }, playerOwned: onPlayerActor(item) };
+    let change = `= ${to}`;
+    if (had) {
+      entry.quantity.from = from;
+      change = `${from} → ${to}`;
+      if (typeof from === "number" && typeof to === "number") {
+        entry.quantity.delta = to - from;
+        change += ` (${to >= from ? "+" : ""}${to - from})`;
       }
     }
-    if (doc.documentName === "Macro" && doc.type === "script" && all.some((c) => c.path === "command")) tags.push("macro");
-
-    const parts = all
-      .slice(0, SUMMARY_CHANGES)
-      .map((c) => `${shortPath(c.path)} ${"from" in c ? `${short(c.from)} → ` : "= "}${short(c.to)}`);
-    if (all.length > SUMMARY_CHANGES) parts.push(`+${all.length - SUMMARY_CHANGES} more`);
-    entry.summary = `${w.user} updated ${label(d)}: ${parts.join("; ")}`;
-    emit(entry);
+    emit({ ...entry, tags: itemTags(item, "quantity"), summary: `${w.user} changed ${label(d)}: quantity ${change}` });
   };
 
-  const onDelete = (doc, _options, userId) => {
+  const onDeleteItem = (item, _options, userId) => {
+    if (!isPhysical(item) || item.pack) return;
+    forget(item);
     const w = who(userId);
-    if (doc.documentName === "ChatMessage") {
-      const chat = chatInfo(doc);
-      const by = chat.authorId && chat.authorId !== userId ? ` (written by ${chat.author})` : "";
-      emit({
-        kind: "chat-delete",
-        ...w,
-        chat,
-        tags: ["chat-delete"],
-        summary: `${w.user} DELETED chat message${by}: ${chatText(chat)}`,
-      });
-      return;
-    }
-    const d = docInfo(doc);
-    const tags = [];
-    const extra = {};
-    const onPlayerActor = isTracked(ownerActor(doc)) && doc.documentName !== "Actor";
-    if (doc.documentName === "Item") {
-      if (doc.system?.quantity !== undefined) extra.quantity = doc.system.quantity;
-      if (onPlayerActor && isPhysical(doc)) tags.push("item-delete");
-      if (onPlayerActor && isCoin(doc)) tags.push("coins");
-    }
-    if (doc.documentName === "Actor") tags.push("actor-delete");
-    const qty = extra.quantity !== undefined ? ` ×${extra.quantity}` : "";
-    emit({ kind: "delete", ...w, doc: d, ...extra, tags, summary: `${w.user} deleted ${label(d)}${qty}` });
-    forget(doc);
+    const d = docInfo(item);
+    const quantity = item.system?.quantity ?? null;
+    emit({
+      kind: "delete",
+      ...w,
+      doc: d,
+      quantity,
+      playerOwned: onPlayerActor(item),
+      tags: itemTags(item, "item-delete"),
+      summary: `${w.user} deleted ${label(d)} ×${quantity}`,
+    });
+  };
+
+  // Items that come with a new actor (imported NPC, Item Piles loot pile) fire no createItem hook.
+  const onCreateActor = (actor, _options, userId) => {
+    if (actor.pack) return;
+    rememberActor(actor);
+    const items = [...(actor.items ?? [])].filter(isPhysical);
+    if (!items.length) return;
+    const w = who(userId);
+    const d = docInfo(actor);
+    const list = items.map((i) => ({ name: i.name, uuid: i.uuid, quantity: i.system?.quantity ?? null, coin: !!isCoin(i) }));
+    const shown = list.slice(0, MAX_ITEMS_LISTED).map((i) => `${i.name} ×${i.quantity}`);
+    if (list.length > MAX_ITEMS_LISTED) shown.push(`+${list.length - MAX_ITEMS_LISTED} more`);
+    emit({
+      kind: "create",
+      ...w,
+      doc: d,
+      items: list,
+      playerOwned: actor.hasPlayerOwner === true,
+      tags: items.some(isCoin) ? ["item-create", "coins"] : ["item-create"],
+      summary: `${w.user} created ${label(d)} with items: ${shown.join(", ")}`,
+    });
   };
 
   // ----------------------------------------------------- registration
 
-  let types = Array.isArray(CONST.ALL_DOCUMENT_TYPES) ? [...CONST.ALL_DOCUMENT_TYPES] : [];
-  if (!types.length) types = Object.keys(CONFIG).filter((k) => CONFIG[k]?.documentClass);
-  types = types.filter((t) => !ignoreTypes.has(t));
-
-  for (const name of types) {
-    HooksApi.on(`create${name}`, guard(onCreate));
-    HooksApi.on(`update${name}`, guard(onUpdate));
-    HooksApi.on(`delete${name}`, guard(onDelete));
-  }
-
+  HooksApi.on("createItem", guard(onCreateItem));
+  HooksApi.on("updateItem", guard(onUpdateItem));
+  HooksApi.on("deleteItem", guard(onDeleteItem));
+  HooksApi.on("createActor", guard(onCreateActor));
+  HooksApi.on("deleteActor", guard((actor) => forget(actor)));
   HooksApi.on(
-    "userConnected",
-    guard((user, connected) => {
-      emit({
-        kind: connected ? "connect" : "disconnect",
-        ...who(user.id),
-        summary: `${user.name} ${connected ? "connected" : "disconnected"}`,
-      });
+    "createToken",
+    guard((token) => {
+      if (!token.actorLink) rememberActor(token.actor);
     }),
   );
+  HooksApi.on("deleteToken", guard((token) => forget(token)));
 
   // Requests players send to "the GM" (PF2e item transfers, socketlib executeAsGM, ...).
+  // A GM client carries the transfer out, so this line is what shows who asked for it.
   const channels = [...new Set([`system.${game.system.id}`, ...(cfg.socketChannels ?? [])])];
   for (const channel of channels) {
     game.socket.on(
@@ -437,7 +295,7 @@ function installActionLogger(cfg) {
     );
   }
 
-  globalThis.__gmActionLogger = { version: 1, snaps, types, channels };
+  globalThis.__gmActionLogger = { version: 2, qty, channels };
 
   const online = game.users.filter((u) => u.active).map((u) => u.name);
   emit({
@@ -446,9 +304,9 @@ function installActionLogger(cfg) {
     foundry: game.version ?? null,
     system: `${game.system.id} ${game.system.version}`,
     online,
-    trackedActors: tracked,
-    summary: `logger started in "${world}" — online: ${online.join(", ") || "nobody"}; tracking ${tracked} player-owned actors`,
+    trackedItems: qty.size,
+    summary: `logger started in "${world}" — online: ${online.join(", ") || "nobody"}; tracking ${qty.size} items`,
   });
 
-  return `installed (${types.length} document types, ${tracked} player-owned actors tracked, sockets: ${channels.join(", ")})`;
+  return `installed (${qty.size} items tracked, sockets: ${channels.join(", ")})`;
 }

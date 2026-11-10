@@ -5,7 +5,8 @@
  * Keeps one GM user (default "Server GM", role Assistant GM) logged into the
  * running world from a headless Chromium, so actions that need "a GM online"
  * keep working when you are not connected. Optionally injects action-logger.js
- * and writes everything players do to logs/actions-YYYY-MM-DD.jsonl.
+ * and writes item creations, deletions and quantity changes (coins included)
+ * to logs/actions-YYYY-MM-DD.jsonl.
  *
  * It self-heals: server restarts, daily world switches, lost sockets, crashed
  * tabs and page reloads are all detected on the next check and re-joined.
@@ -43,8 +44,6 @@ const CFG = {
   readyTimeoutMs: Number(env.READY_TIMEOUT_MS || 180_000),
   browserErrors: bool(env.LOG_BROWSER_ERRORS, false),
   logger: {
-    ignoreTypes: list(env.IGNORE_TYPES ?? "FogExploration"),
-    ignorePaths: list(env.IGNORE_PATHS ?? "_id,_stats,_movementHistory"),
     socketChannels: list(env.SOCKET_CHANNELS ?? "module.socketlib"),
     maxString: Number(env.MAX_STRING || 300),
   },
