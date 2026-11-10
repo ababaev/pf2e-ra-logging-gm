@@ -35,11 +35,11 @@ WORLDS_DIR="$FOUNDRY_DATA/Data/worlds"
 
 declare -A WORLD_BY_DAY=(
     [1]="abomination-vault"
-    [2]="secrets-of-grayce"
-    [3]="secrets-of-grayce"
-    [4]="secrets-of-grayce"
-    [5]="secrets-of-grayce"
-    [6]="abomination-vault"
+    [2]="unknown-world"
+    [3]="unknown-world"
+    [4]="unknown-world"
+    [5]="unknown-world"
+    [6]="unknown-world"
     [7]="abomination-vault"
 )
 
